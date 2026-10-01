@@ -75,9 +75,21 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
         preparedModel: PreparedModel,
         options: EngineOptions = EngineOptions()
     ) async throws {
-        let engine = try await EngineImpl(
+        var engine = try await EngineImpl(
             config: config, preparedModel: preparedModel, options: options)
-        self.engine = engine
+        if engine.prefillFunction != nil {
+            // Specialize the prefill graph at its full width before the first prompt.
+            // MPSGraph keeps one specialization per executable and serves query lengths
+            // from half its width up to it; a wider chunk, or one below half, makes it
+            // re-specialize, and on macOS 27.0 that keeps the previous working memory.
+            // Warmed at full width, every balanced chunk (`prefillChunkSizes`) of every
+            // later prompt stays inside this one specialization, and `main` is warmed
+            // at the single token it serves. The resident footprint then stays flat
+            // across calls instead of growing by a chunk's working set on each one.
+            try await engine.performWarmup(
+                queryLength: engine.prefillMaxQueryLength, samplingConfig: nil)
+        }
+        self.engine = consume engine
         self.config = config
     }
 
@@ -609,6 +621,12 @@ private struct EngineImpl: ~Copyable {
     // State
     var processedTokenCount: Int = 0
     var step: Int = 0
+
+    /// Query length of the prefill graph's last run (0 before any). MPSGraph serves a
+    /// dynamic-shape executable from one specialization that covers query lengths from
+    /// half of the specialized length up to it, so this is the top of the range the
+    /// prefill graph is specialized for right now. See `prefill(prompt:)`.
+    var prefillGraphQueryLength: Int = 0
 
     // Backpressure gate — see PipelineGate doc-comment for the failure mode it prevents.
     // Capacity matches pipeline depth: {encode logits + sampler commit + optional KV-cache grow} in flight.
@@ -1632,11 +1650,23 @@ private struct EngineImpl: ~Copyable {
     /// chunk threshold, and the trailing partial chunk carries the logits.
     private mutating func prefill(prompt: [Int32]) async throws -> ArraySlice<Int32> {
         if prefillFunction != nil {
-            var head = prompt.dropLast()
-            for chunk in prefillChunkSizes(
+            let plan = prefillChunkSizes(
                 tokenCount: prompt.count, chunkSize: prefillMaxQueryLength,
                 heldBack: prefillHeldBackTokens(hasPrefillGraph: true))
+            // A chunk wider than the current specialization makes MPSGraph specialize
+            // again, and on macOS 27.0 each specialization keeps its predecessor's
+            // working memory. When that is about to happen anyway, specialize at the
+            // full width once, so every later chunk (balanced chunks are never under
+            // half the width) stays inside that one range instead of climbing through
+            // a new specialization per wider prompt. Only on a fresh sequence: with a
+            // cached prefix in the KV cache a scratch chunk would overwrite it.
+            if let widest = plan.max(), widest > prefillGraphQueryLength,
+                widest < prefillMaxQueryLength, processedTokenCount == 0
             {
+                try await specializePrefillGraphAtFullWidth()
+            }
+            var head = prompt.dropLast()
+            for chunk in plan {
                 try await _encodeChunk(tokens: Array(head.prefix(chunk)))
                 head = head.dropFirst(chunk)
             }
@@ -1756,9 +1786,32 @@ private struct EngineImpl: ~Copyable {
                 computeStream: computeStream)
         }
 
+        if prefillFunction != nil {
+            prefillGraphQueryLength = queryLength
+        }
         processedTokenCount += queryLength
         step += 1
         InstrumentsProfiler.endCustomInterval(name: "CoreAIPipelinedChunk", signpostID: chunkID)
+    }
+
+    /// Run the prefill graph once at its full width on scratch tokens and discard the
+    /// result, so that MPSGraph specializes it for the widest range it will serve.
+    ///
+    /// Only valid on a fresh sequence (`processedTokenCount == 0`): the scratch chunk
+    /// writes the KV cache from position 0, which the real prompt then overwrites, and
+    /// the fixed states are zeroed again afterwards as `reset()` zeroes them.
+    private mutating func specializePrefillGraphAtFullWidth() async throws {
+        precondition(processedTokenCount == 0, "scratch prefill would clobber a live sequence")
+        let width = prefillMaxQueryLength
+        if try kvCache.ensureCapacity(forContextLength: width, queue: pipelineQueue) {
+            CLILogger.log("KV cache grew to \(kvCache.currentCapacity) to specialize the prefill graph")
+        }
+        CLILogger.log("Specializing the prefill graph at \(width) tokens")
+        try await _encodeChunk(tokens: Array(repeating: 0, count: width))
+        await computeStream.currentWorkCompleted()
+        processedTokenCount = 0
+        step = 0
+        additionalStates?.reset()
     }
 
     mutating func reset() {
@@ -1854,6 +1907,7 @@ private struct EngineImpl: ~Copyable {
             // to avoid compiling unused kernels: the logits buffer holds a single row in
             // that case, so a wide warmup on `function` would overrun it.
             if shape > 1, let prefillFn = prefillFunction {
+                prefillGraphQueryLength = shape
                 try encodeWithStatesNoOutputs(
                     function: prefillFn, inputs: asyncInputs,
                     keyState: &keyState, keyCacheName: keyCacheName,

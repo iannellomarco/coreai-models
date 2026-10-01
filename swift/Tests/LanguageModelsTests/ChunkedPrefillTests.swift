@@ -46,8 +46,9 @@ struct ChunkedPrefillTests {
             return self.rows(for: chunk, vocabSize: vocabSize)
         }
 
-        // Contiguous chunks of width 4 covering all 10 tokens, none held back.
-        #expect(recorder.calls.map(\.tokens) == [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9]])
+        // Contiguous chunks covering all 10 tokens in the three passes width 4 takes,
+        // balanced so no pass is a short tail; none held back.
+        #expect(recorder.calls.map(\.tokens) == [[0, 1, 2, 3], [4, 5, 6], [7, 8, 9]])
         #expect(recorder.calls.allSatisfy { !$0.heldBack })
 
         // Last token is 9, so the returned row is [9, 9, 9].
@@ -90,8 +91,9 @@ struct ChunkedPrefillTests {
             return isHeldBack ? self.rows(for: chunk, vocabSize: vocabSize) : []
         }
 
-        // Nine tokens prefilled as [4, 4, 1] (not held back), then token 9 held back.
-        #expect(recorder.calls.map(\.tokens) == [[0, 1, 2, 3], [4, 5, 6, 7], [8], [9]])
+        // Nine tokens prefilled as [3, 3, 3] (not held back: three balanced passes where
+        // width 4 would have taken [4, 4, 1]), then token 9 held back.
+        #expect(recorder.calls.map(\.tokens) == [[0, 1, 2], [3, 4, 5], [6, 7, 8], [9]])
         #expect(recorder.calls.map(\.heldBack) == [false, false, false, true])
 
         // The held-back token 9 supplies the logits.

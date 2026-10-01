@@ -50,16 +50,22 @@ func prefillLogitsInitialCapacity(hasPrefillGraph: Bool, averagePromptSize: Int)
 ///
 /// `heldBack` comes from `prefillHeldBackTokens`. Returns an empty array when there is
 /// nothing to prefill -- a prompt at or below `heldBack` is entirely the caller's to run.
+///
+/// The prompt takes as many chunks as `chunkSize`-wide ones would, but balanced: every
+/// chunk is within one token of the others, so none is narrower than half of `chunkSize`
+/// when there is more than one. A full-width run followed by a short remainder is what
+/// MPSGraph's shape shifter re-specializes on (a query length below half of the one it
+/// specialized for), and on macOS 27.0 each re-specialization keeps the previous
+/// executable's working memory: hundreds of MB per call for a 2048-token chunk. Chunks
+/// that all sit in the upper half of the width stay inside one specialization.
 func prefillChunkSizes(tokenCount: Int, chunkSize: Int, heldBack: Int) -> [Int] {
     let width = max(1, chunkSize)
-    var remaining = max(0, tokenCount - max(0, heldBack))
-    var sizes: [Int] = []
-    while remaining > 0 {
-        let chunk = min(width, remaining)
-        sizes.append(chunk)
-        remaining -= chunk
-    }
-    return sizes
+    let total = max(0, tokenCount - max(0, heldBack))
+    guard total > 0 else { return [] }
+    let count = (total + width - 1) / width
+    let base = total / count
+    let extra = total % count
+    return (0..<count).map { $0 < extra ? base + 1 : base }
 }
 
 // MARK: - Loading

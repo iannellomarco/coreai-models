@@ -66,12 +66,47 @@ struct PrefillGraphTests {
         #expect(prefillChunkSizes(tokenCount: 40, chunkSize: 64, heldBack: 1) == [39])
     }
 
-    @Test("A long prompt splits into full chunks plus a remainder")
+    @Test("A long prompt splits into chunks of nearly equal width")
     func multipleChunks() {
-        // 400 tokens, 399 to prefill: six 64s and a 15.
+        // 400 tokens, 399 to prefill: as many chunks as 64-wide ones would take (seven),
+        // but balanced, so there is no 15-token tail after six full chunks.
         let sizes = prefillChunkSizes(tokenCount: 400, chunkSize: 64, heldBack: 1)
-        #expect(sizes == [64, 64, 64, 64, 64, 64, 15])
+        #expect(sizes == [57, 57, 57, 57, 57, 57, 57])
         #expect(sizes.reduce(0, +) == 399)
+    }
+
+    @Test("No chunk of a split prompt is narrower than half the width")
+    func noChunkNarrowerThanHalfWidth() {
+        // MPSGraph specializes a dynamic-shape executable for a range of query lengths
+        // and re-specializes when a run falls below half the length it specialized for.
+        // On macOS 27.0 every re-specialization keeps the previous executable's working
+        // memory, hundreds of MB for a 2048-token chunk, so a trailing remainder chunk
+        // leaks that much on every call. Balanced chunks stay inside one range.
+        for count in [65, 66, 100, 129, 130, 200, 257, 1000, 1025, 2049, 2050, 4097] {
+            let sizes = prefillChunkSizes(tokenCount: count, chunkSize: 64, heldBack: 1)
+            guard sizes.count > 1 else { continue }
+            for chunk in sizes {
+                #expect(chunk >= 32, "chunk \(chunk) of \(sizes) at \(count) tokens")
+            }
+        }
+    }
+
+    @Test("Chunks of a split prompt differ by at most one token")
+    func chunksDifferByAtMostOne() {
+        for count in [65, 100, 129, 200, 400, 1000, 4097] {
+            let sizes = prefillChunkSizes(tokenCount: count, chunkSize: 64, heldBack: 1)
+            guard let lo = sizes.min(), let hi = sizes.max() else { continue }
+            #expect(hi - lo <= 1, "\(sizes) at \(count) tokens")
+        }
+    }
+
+    @Test("Balancing never adds a chunk beyond what full-width chunks would take")
+    func balancingKeepsChunkCount() {
+        // Prefill cost is per chunk, so balancing must not split finer than needed.
+        for count in [65, 100, 129, 200, 400, 1000, 4097] {
+            let sizes = prefillChunkSizes(tokenCount: count, chunkSize: 64, heldBack: 1)
+            #expect(sizes.count == (count - 1 + 63) / 64, "\(sizes) at \(count) tokens")
+        }
     }
 
     @Test("An exact multiple leaves no remainder chunk")
@@ -109,7 +144,7 @@ struct PrefillGraphTests {
         // is chunked and none is held back.
         let sizes = prefillChunkSizes(tokenCount: 400, chunkSize: 64, heldBack: 0)
         #expect(sizes.reduce(0, +) == 400)
-        #expect(sizes == [64, 64, 64, 64, 64, 64, 16])
+        #expect(sizes == [58, 57, 57, 57, 57, 57, 57])
     }
 
     @Test("A degenerate chunk size still terminates")
@@ -178,8 +213,8 @@ struct PrefillGraphTests {
         #expect(prefillLogitsInitialCapacity(hasPrefillGraph: true, averagePromptSize: 256) == 1)
     }
 
-    /// The walk `prefillChunkSizes` replaced in `processChunkedPrompt`, kept as a reference
-    /// so the extraction can be held to it.
+    /// The walk `prefillChunkSizes` replaced in `processChunkedPrompt`, kept as a reference:
+    /// the balanced plan covers the same tokens in the same number of chunks.
     private func legacyChunkWalk(tokenCount: Int, chunkSize: Int, floor: Int) -> [Int] {
         var sizes: [Int] = []
         var remaining = tokenCount
@@ -191,19 +226,22 @@ struct PrefillGraphTests {
         return sizes
     }
 
-    @Test("The plan matches the loop it replaced, with and without a prefill graph")
+    @Test("The plan covers what the loop it replaced covered, in as many chunks")
     func planMatchesLegacyWalk() {
-        // Guards the "no behaviour change" claim for both engines across the seams.
+        // Same tokens prefilled and the same number of passes for both engines across the
+        // seams; only the split between the chunks is balanced now.
         for hasPrefillGraph in [true, false] {
             let heldBack = prefillHeldBackTokens(hasPrefillGraph: hasPrefillGraph)
             for chunkSize in [1, 8, 64, 512] {
                 for count in [0, 1, 2, 7, 8, 9, 63, 64, 65, 127, 128, 129, 400, 1000] {
+                    let plan = prefillChunkSizes(
+                        tokenCount: count, chunkSize: chunkSize, heldBack: heldBack)
+                    let legacy = legacyChunkWalk(
+                        tokenCount: count, chunkSize: chunkSize, floor: heldBack)
                     #expect(
-                        prefillChunkSizes(
-                            tokenCount: count, chunkSize: chunkSize, heldBack: heldBack)
-                            == legacyChunkWalk(
-                                tokenCount: count, chunkSize: chunkSize, floor: heldBack),
+                        plan.count == legacy.count && plan.reduce(0, +) == legacy.reduce(0, +),
                         "prefillGraph=\(hasPrefillGraph) chunkSize=\(chunkSize) count=\(count)")
+                    #expect(plan.allSatisfy { $0 >= 1 && $0 <= max(1, chunkSize) })
                 }
             }
         }
