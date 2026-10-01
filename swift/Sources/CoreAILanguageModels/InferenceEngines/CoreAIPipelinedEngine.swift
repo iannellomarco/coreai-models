@@ -1562,6 +1562,10 @@ private struct EngineImpl: ~Copyable {
         var asyncStates = InferenceFunction.AsyncMutableViews()
         asyncStates.insert(&keyState, for: keyCacheName)
         asyncStates.insert(&valState, for: valueCacheName)
+        // Bind the extra persistent states (sliding caches, hybrid states) exactly as
+        // encodeWithStates does; without them any model with more than the KV pair
+        // fails with "Missing state view for <name>" on the constrained path.
+        additionalStates?.bind(into: &asyncStates)
 
         // Safe: constrained loop awaits each token before encoding the next step, so logits are consumed before overwrite.
         let logitsBuffer = logits.metalBuffer
