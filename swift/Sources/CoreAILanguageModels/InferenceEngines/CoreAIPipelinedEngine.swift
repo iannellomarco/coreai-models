@@ -1563,6 +1563,10 @@ private struct EngineImpl: ~Copyable {
         additionalStates?.bind(into: &asyncStates)
 
         // Safe: constrained loop awaits each token before encoding the next step, so logits are consumed before overwrite.
+        // A jump-forward step encodes the sampled token plus the grammar's forced run in
+        // one go, and that needs a row per token. The buffer starts at one row on an
+        // asset with a prefill graph, so grow it to the step, never to the prompt.
+        try logits.ensureCapacity(forContextLength: queryLength)
         let logitsBuffer = logits.metalBuffer
         let logitsShape = [1, queryLength, vocabSize]
         let logitsStrides = try resolvedStrides(descriptor: logitsBaseDesc, shape: logitsShape)
