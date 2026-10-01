@@ -68,6 +68,41 @@ func prefillChunkSizes(tokenCount: Int, chunkSize: Int, heldBack: Int) -> [Int] 
     return (0..<count).map { $0 < extra ? base + 1 : base }
 }
 
+// MARK: - Shape specialization
+
+/// The top of the query-length range the prefill graph is specialized for after a run of
+/// `queryLength` tokens, given the top before it (0 before any run).
+///
+/// MPSGraph serves a dynamic-shape executable from one specialization that covers query
+/// lengths from half the specialized length up to it. A run inside that range leaves it as
+/// it is, so a narrower run must not lower the top; a run below half of it or past it
+/// specializes again at the run's length (and on macOS 27.0 keeps the previous working
+/// memory). The measured floor for a 2048 specialization sits a little under 1024, so
+/// treating everything under exactly half as a new specialization errs toward one spare
+/// full-width pass, never toward a missed one.
+func prefillGraphSpecialization(afterRunOf queryLength: Int, specializedFor current: Int) -> Int {
+    if current <= 0 || queryLength > current || queryLength * 2 < current {
+        return queryLength
+    }
+    return current
+}
+
+/// Whether a fresh sequence specializes the prefill graph at its full `width` before it
+/// runs `plan`, given the top of the range it is specialized for now.
+///
+/// Only when the plan would specialize again anyway, its widest chunk being past the
+/// current top, and every chunk then fits the full-width range, none being narrower than
+/// half the width (balanced chunks of a split prompt never are). A plan inside the current
+/// range needs no pass: it would cost a full-width prefill for nothing. A single chunk under
+/// half the width specializes again whatever runs first, so a full-width pass would only
+/// add a second specialization, and with it a second block of kept working memory.
+func prefillPlanNeedsFullWidthSpecialization(
+    plan: [Int], specializedFor current: Int, width: Int
+) -> Bool {
+    guard let widest = plan.max(), widest < width else { return false }
+    return widest > current && widest * 2 >= width
+}
+
 // MARK: - Loading
 
 /// Check a prefill descriptor against `main`, throwing if it can't be bound the same way.

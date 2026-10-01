@@ -247,6 +247,86 @@ struct PrefillGraphTests {
         }
     }
 
+    // MARK: - Shape specialization
+
+    // MPSGraph serves the prefill graph from one specialization covering query lengths
+    // from half the specialized length up to it, and on macOS 27.0 every new
+    // specialization keeps the previous one's working memory (about 380 MB at 2048).
+
+    @Test("A run inside the specialized range keeps the specialization")
+    func runInsideRangeKeepsSpecialization() {
+        // The prefill graph warmed at 2048 serves 1024...2048 as it is.
+        for queryLength in [1024, 1091, 1495, 2047, 2048] {
+            #expect(
+                prefillGraphSpecialization(afterRunOf: queryLength, specializedFor: 2048) == 2048,
+                "at \(queryLength)")
+        }
+        #expect(prefillGraphSpecialization(afterRunOf: 300, specializedFor: 500) == 500)
+    }
+
+    @Test("A run below half the range or past its top specializes again at its length")
+    func runOutsideRangeRespecializes() {
+        #expect(prefillGraphSpecialization(afterRunOf: 866, specializedFor: 2048) == 866)
+        #expect(prefillGraphSpecialization(afterRunOf: 1023, specializedFor: 2048) == 1023)
+        #expect(prefillGraphSpecialization(afterRunOf: 1464, specializedFor: 866) == 1464)
+        #expect(prefillGraphSpecialization(afterRunOf: 139, specializedFor: 0) == 139)
+    }
+
+    /// Replays the engine's prefill bookkeeping over fresh prompts after the full-width
+    /// warmup at load: the full-width passes it takes, and how often the prefill graph
+    /// specializes again (each one keeps working memory for good).
+    private func replay(prompts: [Int], width: Int = 2048) -> (
+        fullWidthPasses: Int, respecializations: Int
+    ) {
+        var top = prefillGraphSpecialization(afterRunOf: width, specializedFor: 0)
+        var passes = 0
+        var respecializations = 0
+        func run(_ queryLength: Int) {
+            let next = prefillGraphSpecialization(afterRunOf: queryLength, specializedFor: top)
+            if next != top { respecializations += 1 }
+            top = next
+        }
+        for count in prompts {
+            let plan = prefillChunkSizes(
+                tokenCount: count, chunkSize: width,
+                heldBack: prefillHeldBackTokens(hasPrefillGraph: true))
+            if prefillPlanNeedsFullWidthSpecialization(
+                plan: plan, specializedFor: top, width: width)
+            {
+                passes += 1
+                run(width)
+            }
+            plan.forEach(run)
+        }
+        return (passes, respecializations)
+    }
+
+    @Test("Prompts past half the width run inside the warmed specialization, with no extra pass")
+    func longPromptsStayInsideWarmedSpecialization() {
+        // A full-width pass costs a 2048-token prefill (about a second on Gemma 4 E4B): it
+        // must not run when every chunk already fits the range it is specialized for.
+        let result = replay(prompts: [2183, 2991, 4494, 1465, 3094, 2183, 7601])
+        #expect(result.fullWidthPasses == 0)
+        #expect(result.respecializations == 0)
+    }
+
+    @Test("Prompts under half the width never take a full-width pass")
+    func shortPromptsTakeNoFullWidthPass() {
+        // Their one chunk specializes again whatever came before; a full-width pass first
+        // would add a 2048-wide specialization to every rising short prompt.
+        let result = replay(prompts: [139, 300, 500, 800, 1000])
+        #expect(result.fullWidthPasses == 0)
+        #expect(result.respecializations == 5)
+    }
+
+    @Test("A long prompt after a short one specializes at full width once, then stays")
+    func longAfterShortSpecializesOnce() {
+        let result = replay(prompts: [139, 2183, 2991, 4494, 1465, 3094])
+        #expect(result.fullWidthPasses == 1)
+        // Down to 138 for the short prompt, back up to 2048 once.
+        #expect(result.respecializations == 2)
+    }
+
     // MARK: - Descriptor validation
 
     private let mainInputs = ["input_ids", "position_ids"]

@@ -622,10 +622,11 @@ private struct EngineImpl: ~Copyable {
     var processedTokenCount: Int = 0
     var step: Int = 0
 
-    /// Query length of the prefill graph's last run (0 before any). MPSGraph serves a
-    /// dynamic-shape executable from one specialization that covers query lengths from
-    /// half of the specialized length up to it, so this is the top of the range the
-    /// prefill graph is specialized for right now. See `prefill(prompt:)`.
+    /// Top of the query-length range the prefill graph is specialized for right now (0
+    /// before any run). MPSGraph serves a dynamic-shape executable from one specialization
+    /// that covers query lengths from half of the specialized length up to it, so a run
+    /// inside that range leaves this as it is; see `prefillGraphSpecialization` and
+    /// `prefill(prompt:)`.
     var prefillGraphQueryLength: Int = 0
 
     // Backpressure gate — see PipelineGate doc-comment for the failure mode it prevents.
@@ -1655,13 +1656,18 @@ private struct EngineImpl: ~Copyable {
                 heldBack: prefillHeldBackTokens(hasPrefillGraph: true))
             // A chunk wider than the current specialization makes MPSGraph specialize
             // again, and on macOS 27.0 each specialization keeps its predecessor's
-            // working memory. When that is about to happen anyway, specialize at the
-            // full width once, so every later chunk (balanced chunks are never under
-            // half the width) stays inside that one range instead of climbing through
-            // a new specialization per wider prompt. Only on a fresh sequence: with a
-            // cached prefix in the KV cache a scratch chunk would overwrite it.
-            if let widest = plan.max(), widest > prefillGraphQueryLength,
-                widest < prefillMaxQueryLength, processedTokenCount == 0
+            // working memory. When that is about to happen anyway and the plan's chunks
+            // fit the full-width range, specialize at the full width once, so every later
+            // chunk (balanced chunks are never under half the width) stays inside that one
+            // range instead of climbing through a new specialization per wider prompt. A
+            // plan already inside the range, or a single chunk under half the width, runs
+            // as it is (`prefillPlanNeedsFullWidthSpecialization`). Only on a fresh
+            // sequence: with a cached prefix in the KV cache a scratch chunk would
+            // overwrite it.
+            if processedTokenCount == 0,
+                prefillPlanNeedsFullWidthSpecialization(
+                    plan: plan, specializedFor: prefillGraphQueryLength,
+                    width: prefillMaxQueryLength)
             {
                 try await specializePrefillGraphAtFullWidth()
             }
@@ -1787,7 +1793,8 @@ private struct EngineImpl: ~Copyable {
         }
 
         if prefillFunction != nil {
-            prefillGraphQueryLength = queryLength
+            prefillGraphQueryLength = prefillGraphSpecialization(
+                afterRunOf: queryLength, specializedFor: prefillGraphQueryLength)
         }
         processedTokenCount += queryLength
         step += 1
@@ -1907,7 +1914,8 @@ private struct EngineImpl: ~Copyable {
             // to avoid compiling unused kernels: the logits buffer holds a single row in
             // that case, so a wide warmup on `function` would overrun it.
             if shape > 1, let prefillFn = prefillFunction {
-                prefillGraphQueryLength = shape
+                prefillGraphQueryLength = prefillGraphSpecialization(
+                    afterRunOf: shape, specializedFor: prefillGraphQueryLength)
                 try encodeWithStatesNoOutputs(
                     function: prefillFn, inputs: asyncInputs,
                     keyState: &keyState, keyCacheName: keyCacheName,
