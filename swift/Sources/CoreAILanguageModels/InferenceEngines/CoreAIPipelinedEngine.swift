@@ -1297,16 +1297,11 @@ private struct EngineImpl: ~Copyable {
         let totalNeeded = prompt.count + maxTokens
         try kvCache.ensureCapacity(forContextLength: totalNeeded, queue: pipelineQueue)
 
-        // Prefill prompt (unconstrained -- grammar doesn't constrain the prompt)
-        let prefillTokens: [Int32]
-        if case .chunk(let threshold, _) = inputLayout.prefillPolicy,
-            prompt.count > threshold
-        {
-            let remaining = try await processChunkedInput(tokens: prompt)
-            prefillTokens = Array(remaining)
-        } else {
-            prefillTokens = prompt
-        }
+        // Prefill prompt (unconstrained -- grammar doesn't constrain the prompt), the same
+        // way runCompletion does: through the prefill graph when the asset has one, so
+        // `main` sees only the held-back token and the logits buffer stays at one row
+        // instead of growing with the prompt (several GB at large vocabularies).
+        let prefillTokens = Array(try await prefill(prompt: prompt))
 
         try logits.ensureCapacity(forContextLength: max(1, prefillTokens.count))
 
